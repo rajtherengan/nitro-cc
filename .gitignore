@@ -1,0 +1,13 @@
+*.pem
+aws/.stack
+kms/plaintext_key.b64
+kms/wrapped_key.b64
+kms/*.json
+!kms/enclave-key-policy.json
+
+*.eif
+enclave/measurements.json
+enclave/bin/*
+!enclave/bin/.gitkeep
+__pycache__/
+*.pyc

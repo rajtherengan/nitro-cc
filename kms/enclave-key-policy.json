@@ -1,0 +1,49 @@
+{
+  "_comment": [
+    "This is the whole security story in one file. The Decrypt statement is",
+    "conditioned on kms:RecipientAttestation:PCR0, which KMS checks against the",
+    "attestation document the enclave sends in the Recipient parameter.",
+    "",
+    "Consequence: even root on the parent instance cannot decrypt the data key.",
+    "They hold the credentials, but their calls carry no attestation document,",
+    "so KMS refuses. Change one line of the Dockerfile, PCR0 moves, and KMS",
+    "refuses your own enclave too -- that is the feature working.",
+    "",
+    "Replace <ACCOUNT_ID>, <PCR0_FROM_BUILD>, and <PARENT_ROLE> before applying.",
+    "Get PCR0 from scripts/10_build_enclave.sh output."
+  ],
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AdminCanManageButNotUseTheKey",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::<ACCOUNT_ID>:root" },
+      "Action": [
+        "kms:Create*", "kms:Describe*", "kms:Enable*", "kms:List*",
+        "kms:Put*", "kms:Update*", "kms:Revoke*", "kms:Disable*",
+        "kms:Get*", "kms:Delete*", "kms:ScheduleKeyDeletion",
+        "kms:CancelKeyDeletion"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ParentMayEncryptOnly",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::<ACCOUNT_ID>:role/<PARENT_ROLE>" },
+      "Action": ["kms:Encrypt", "kms:GenerateDataKey"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DecryptOnlyInsideTheAttestedEnclave",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::<ACCOUNT_ID>:role/<PARENT_ROLE>" },
+      "Action": "kms:Decrypt",
+      "Resource": "*",
+      "Condition": {
+        "StringEqualsIgnoreCase": {
+          "kms:RecipientAttestation:PCR0": "<PCR0_FROM_BUILD>"
+        }
+      }
+    }
+  ]
+}
