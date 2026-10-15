@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""
+Analyse paired latency runs and regenerate the paper's latency table and Fig. 1.
+
+    python3 bench/analyze_paired.py bench/paired_YYYYMMDD_HHMM.csv [--out bench/analysis]
+
+Works on the new paired CSV and on the original bench/controlled_*.csv (where
+run k of the enclave and run k of the baseline are treated as a pair).
+
+Per payload size, using each run's median latency (p50) as the unit:
+  * mean and SD of run medians for each path
+  * paired difference  d_k = enclave_k - baseline_k : mean, SD,
+    95% t-interval, 95% bootstrap interval, Wilcoxon signed-rank p
+  * ratio of means (enclave / baseline) with a 95% bootstrap interval
+  * server-side service time (svc_p50) and client-observed minus service time,
+    a coarse split of where the latency goes
+  * order check: mean p50 by position in the pair (first vs second)
+
+Outputs in --out: summary.csv, summary.md, table_latency.tex,
+fig1_latency.pdf and fig1_latency.png.
+Needs numpy and matplotlib; scipy is optional (t-interval and Wilcoxon).
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+import os
+from collections import defaultdict
+
+import numpy as np
+
+try:
+    from scipy import stats
+except ImportError:  # bootstrap intervals still work without scipy
+    stats = None
+
+PAYLOAD_FALLBACK = {1: "160 B", 10: "760 B", 100: "6.6 kB", 1000: "65 kB",
+                    10000: "651 kB"}
+B = 20000
+
+
+def fmt_bytes(n: float | None, records: int) -> str:
+    if not n:
+        return PAYLOAD_FALLBACK.get(records, "")
+    if n < 1000:
+        return f"{n:.0f} B"
+    return f"{n/1000:.1f} kB" if n < 10000 else f"{n/1000:.0f} kB"
+
+
+def load(path: str):
+    data = defaultdict(lambda: defaultdict(dict))  # records -> run -> target -> row
+    with open(path) as fh:
+        for r in csv.DictReader(fh):
+            data[int(r["records"])][int(r["run"])][r["target"]] = r
+    return data
+
+
+def analyse(data, seed: int):
+    rng = np.random.default_rng(seed)
+    out = []
+    for rec in sorted(data):
+        runs = sorted(k for k, v in data[rec].items()
+                      if "enclave" in v and "baseline" in v)
+        b = np.array([float(data[rec][k]["baseline"]["p50"]) for k in runs])
+        e = np.array([float(data[rec][k]["enclave"]["p50"]) for k in runs])
+        bs = np.array([float(data[rec][k]["baseline"]["svc_p50"]) for k in runs])
+        es = np.array([float(data[rec][k]["enclave"]["svc_p50"]) for k in runs])
+        n = len(runs)
+        d = e - b
+        sd = lambda x: float(np.std(x, ddof=1)) if len(x) > 1 else float("nan")  # noqa: E731
+
+        idx = rng.integers(0, n, size=(B, n))
+        boot_d = d[idx].mean(axis=1)
+        boot_r = e[idx].mean(axis=1) / b[idx].mean(axis=1)
+        row = {
+            "records": rec, "n_pairs": n,
+            "payload": fmt_bytes(float(data[rec][runs[0]]["enclave"].get("bytes") or 0), rec),
+            "base_mean": b.mean(), "base_sd": sd(b),
+            "encl_mean": e.mean(), "encl_sd": sd(e),
+            "diff_mean": d.mean(), "diff_sd": sd(d),
+            "diff_boot_lo": float(np.percentile(boot_d, 2.5)),
+            "diff_boot_hi": float(np.percentile(boot_d, 97.5)),
+            "ratio": e.mean() / b.mean(),
+            "ratio_boot_lo": float(np.percentile(boot_r, 2.5)),
+            "ratio_boot_hi": float(np.percentile(boot_r, 97.5)),
+            "base_svc": bs.mean(), "encl_svc": es.mean(),
+            "base_nonsvc": (b - bs).mean(), "encl_nonsvc": (e - es).mean(),
+        }
+        if stats is not None and n > 1:
+            t = stats.t.ppf(0.975, n - 1)
+            h = t * row["diff_sd"] / math.sqrt(n)
+            row["diff_t_lo"], row["diff_t_hi"] = d.mean() - h, d.mean() + h
+            row["base_ci"] = stats.t.ppf(0.975, n - 1) * row["base_sd"] / math.sqrt(n)
+            row["encl_ci"] = stats.t.ppf(0.975, n - 1) * row["encl_sd"] / math.sqrt(n)
+            try:
+                row["wilcoxon_p"] = float(stats.wilcoxon(e, b).pvalue)
+            except ValueError:
+                row["wilcoxon_p"] = float("nan")
+        # order check (only meaningful for the randomised paired CSV)
+        for tgt in ("baseline", "enclave"):
+            for pos in ("1", "2"):
+                vals = [float(data[rec][k][tgt]["p50"]) for k in runs
+                        if data[rec][k][tgt].get("order") == pos]
+                row[f"{tgt}_order{pos}_mean"] = float(np.mean(vals)) if vals else float("nan")
+                row[f"{tgt}_order{pos}_n"] = len(vals)
+        out.append(row)
+    return out
+
+
+def write_csv(rows, path):
+    keys = list(rows[0].keys())
+    with open(path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=keys)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: (f"{v:.6g}" if isinstance(v, float) else v) for k, v in r.items()})
+
+
+def ms(x: float) -> str:
+    return f"{x:.2f}" if abs(x) >= 10 else f"{x:.3f}"
+
+
+def write_tex(rows, path):
+    lines = [r"% Generated by bench/analyze_paired.py -- rows for the latency table",
+             r"% Records & Payload & Baseline (ms) & Enclave (ms) & Delta (ms) [95% CI] & Ratio [95% CI]"]
+    for r in rows:
+        lines.append(
+            f"{r['records']} & {r['payload'].replace(' ', '~')} & "
+            f"${ms(r['base_mean'])}\\pm{ms(r['base_sd'])}$ & "
+            f"${ms(r['encl_mean'])}\\pm{ms(r['encl_sd'])}$ & "
+            f"${r['diff_mean']:.2f}$ $[{r['diff_boot_lo']:.2f}, {r['diff_boot_hi']:.2f}]$ & "
+            f"${r['ratio']:.2f}$ $[{r['ratio_boot_lo']:.2f}, {r['ratio_boot_hi']:.2f}]$ \\\\")
+    open(path, "w").write("\n".join(lines) + "\n")
+
+
+def write_md(rows, path, src, seed):
+    n = rows[0]["n_pairs"]
+    L = [f"# Paired latency analysis\n", f"Source: `{src}`  ", f"Pairs per size: {n}  ",
+         f"Bootstrap: {B} resamples of pairs, seed {seed}\n",
+         "## Run medians (ms)\n",
+         "| Records | Payload | Baseline mean ± SD | Enclave mean ± SD | Δ mean | Δ 95% CI (bootstrap) | Δ 95% CI (t) | Wilcoxon p | Ratio | Ratio 95% CI |",
+         "|---|---|---|---|---|---|---|---|---|---|"]
+    for r in rows:
+        tci = (f"[{r['diff_t_lo']:.3f}, {r['diff_t_hi']:.3f}]" if "diff_t_lo" in r else "n/a")
+        wp = f"{r['wilcoxon_p']:.3g}" if "wilcoxon_p" in r else "n/a"
+        L.append(f"| {r['records']} | {r['payload']} | {ms(r['base_mean'])} ± {ms(r['base_sd'])} | "
+                 f"{ms(r['encl_mean'])} ± {ms(r['encl_sd'])} | {r['diff_mean']:.3f} | "
+                 f"[{r['diff_boot_lo']:.3f}, {r['diff_boot_hi']:.3f}] | {tci} | {wp} | "
+                 f"{r['ratio']:.3f} | [{r['ratio_boot_lo']:.3f}, {r['ratio_boot_hi']:.3f}] |")
+    L += ["\n## Where the time goes (means of run medians, ms)\n",
+          "Server-side service time is measured inside the server; the rest is client-observed",
+          "median minus service median (loopback HTTP, gateway and, for the enclave, the vsock",
+          "crossing). Medians are not additive, so treat the split as approximate.\n",
+          "| Records | Baseline service | Baseline rest | Enclave service | Enclave rest |",
+          "|---|---|---|---|---|"]
+    for r in rows:
+        L.append(f"| {r['records']} | {r['base_svc']:.3f} | {r['base_nonsvc']:.3f} | "
+                 f"{r['encl_svc']:.3f} | {r['encl_nonsvc']:.3f} |")
+    L += ["\n## Order check (mean p50 by position in the pair, ms)\n",
+          "| Records | Baseline 1st | Baseline 2nd | Enclave 1st | Enclave 2nd |", "|---|---|---|---|---|"]
+    for r in rows:
+        f = lambda t, p: (f"{r[f'{t}_order{p}_mean']:.3f} (n={r[f'{t}_order{p}_n']})"  # noqa: E731
+                          if r[f"{t}_order{p}_n"] else "–")
+        L.append(f"| {r['records']} | {f('baseline','1')} | {f('baseline','2')} | "
+                 f"{f('enclave','1')} | {f('enclave','2')} |")
+    open(path, "w").write("\n".join(L) + "\n")
+
+
+def plot(rows, stem):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FixedLocator, FormatStrFormatter, NullFormatter
+    plt.rcParams.update({"font.size": 7.5, "axes.titlesize": 8, "legend.fontsize": 6.8,
+                         "xtick.labelsize": 7, "ytick.labelsize": 7, "pdf.fonttype": 42,
+                         "axes.linewidth": 0.6})
+    r = np.array([x["records"] for x in rows])
+    bm = np.array([x["base_mean"] for x in rows]); em = np.array([x["encl_mean"] for x in rows])
+    be = np.array([x.get("base_ci", x["base_sd"]) for x in rows])
+    ee = np.array([x.get("encl_ci", x["encl_sd"]) for x in rows])
+    q = np.array([x["ratio"] for x in rows])
+    qlo = np.array([x["ratio_boot_lo"] for x in rows]); qhi = np.array([x["ratio_boot_hi"] for x in rows])
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(3.45, 2.75), sharex=True,
+                                 gridspec_kw={"height_ratios": [1.55, 1]})
+    a1.errorbar(r, bm, yerr=be, fmt="-o", color="#444444", ms=3.5, lw=1, capsize=2,
+                label="Baseline (pinned host process)")
+    a1.errorbar(r, em, yerr=ee, fmt="--s", color="#c0392b", ms=3.5, lw=1, capsize=2,
+                label="Enclave (vsock)")
+    a1.set_xscale("log"); a1.set_yscale("log"); a1.set_ylabel("Median latency (ms)")
+    a1.yaxis.set_major_locator(FixedLocator([1, 2, 5, 10, 20, 50]))
+    a1.yaxis.set_minor_formatter(NullFormatter()); a1.yaxis.set_major_formatter(FormatStrFormatter("%g"))
+    a1.set_ylim(1, 80); a1.set_title("(a) End-to-end latency", pad=3)
+    a1.legend(loc="upper left", frameon=False); a1.grid(True, which="major", lw=0.3, alpha=0.5)
+    a2.fill_between(r, qlo, qhi, color="#c0392b", alpha=0.18, lw=0)
+    a2.plot(r, q, "-^", color="#c0392b", ms=3.5, lw=1)
+    a2.axhline(1.0, ls=":", color="k", lw=0.8)
+    a2.set_ylabel("Enclave / baseline"); a2.set_xlabel("Records per request")
+    a2.set_title("(b) Ratio of mean run medians", pad=3)
+    lo = min(0.95, float(qlo.min()) - 0.03); hi = max(1.1, float(qhi.max()) + 0.05)
+    a2.set_ylim(lo, hi); a2.grid(True, which="major", lw=0.3, alpha=0.5)
+    fig.align_ylabels([a1, a2]); fig.tight_layout(pad=0.3, h_pad=0.6)
+    fig.savefig(stem + ".pdf"); fig.savefig(stem + ".png", dpi=200)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("csv")
+    ap.add_argument("--out", default=None)
+    ap.add_argument("--seed", type=int, default=1)
+    a = ap.parse_args()
+    out = a.out or os.path.splitext(a.csv)[0] + "_analysis"
+    os.makedirs(out, exist_ok=True)
+    rows = analyse(load(a.csv), a.seed)
+    write_csv(rows, os.path.join(out, "summary.csv"))
+    write_md(rows, os.path.join(out, "summary.md"), a.csv, a.seed)
+    write_tex(rows, os.path.join(out, "table_latency.tex"))
+    plot(rows, os.path.join(out, "fig1_latency"))
+    print(open(os.path.join(out, "summary.md")).read())
+    print(f"outputs in {out}/")
+
+
+if __name__ == "__main__":
+    main()
